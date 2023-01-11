@@ -106,6 +106,9 @@ class GBLImage:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> GBLImage:
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+
         tags = []
 
         for tag_bytes, value in parse_silabs_gbl(data):
