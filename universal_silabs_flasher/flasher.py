@@ -93,11 +93,11 @@ class Flasher:
                 async with connect_protocol(
                     self._device, baudrate, FlowControlSerialProtocol
                 ) as uart:
-                    await asyncio.sleep(config.delay_after_each)
-
                     # Write command on the last baudrate if specified
                     if baudrate == config.baudrates[-1] and config.command:
                         uart._transport.write(config.command)
+
+                    await asyncio.sleep(config.delay_after_each)
 
             await asyncio.sleep(config.delay_after_final)
         elif isinstance(config, GpioResetConfig):
