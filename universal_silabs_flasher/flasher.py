@@ -16,7 +16,6 @@ from .common import (
     Version,
     asyncio_timeout,
     connect_protocol,
-    pad_to_multiple,
 )
 from .const import (
     DEFAULT_PROBE_METHODS,
@@ -399,16 +398,42 @@ class Flasher:
 
         self.bootloader_baudrate = bootloader_probe.baudrate
 
+    async def flash_firmwares(
+        self,
+        firmwares: list[FirmwareImage],
+        run_firmware: bool = True,
+        progress_callback: typing.Callable[[int, int], typing.Any] | None = None,
+    ) -> None:
+        total_offset = 0
+        firmware_sizes = [
+            len(firmware.serialize(block_size=XMODEM_BLOCK_SIZE))
+            for firmware in firmwares
+        ]
+        total_size = sum(firmware_sizes)
+
+        def combined_progress_callback(offset: int, total: int) -> None:
+            if progress_callback is not None:
+                progress_callback(total_offset + offset, total_size)
+
+        for index, (firmware, firmware_size) in enumerate(
+            zip(firmwares, firmware_sizes)
+        ):
+            await self.enter_bootloader()
+            await self.flash_firmware(
+                firmware,
+                run_firmware=False if index < len(firmwares) - 1 else run_firmware,
+                progress_callback=combined_progress_callback,
+            )
+            total_offset += firmware_size
+
     async def flash_firmware(
         self,
         firmware: FirmwareImage,
         run_firmware: bool = True,
         progress_callback: typing.Callable[[int, int], typing.Any] | None = None,
     ) -> None:
-        data = firmware.serialize()
-
         # Pad the image to the XMODEM block size
-        data = pad_to_multiple(data, XMODEM_BLOCK_SIZE, b"\xff")
+        data = firmware.serialize(block_size=XMODEM_BLOCK_SIZE)
 
         if self.bootloader_baudrate is None:
             _LOGGER.debug("Bootloader baudrate unknown, assuming 115200")

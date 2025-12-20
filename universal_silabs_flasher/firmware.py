@@ -148,7 +148,7 @@ class FirmwareImage:
     def from_bytes(cls, data: bytes) -> FirmwareImage:
         raise NotImplementedError()
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, block_size: int) -> bytes:
         raise NotImplementedError()
 
     def get_first_tag(self, tag_id: GBLTagId) -> bytes:
@@ -176,7 +176,7 @@ class GBLImage(FirmwareImage):
 
         return cls(tags=tags)
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, block_size: int = 4) -> bytes:
         return pad_to_multiple(
             b"".join(
                 [
@@ -184,7 +184,7 @@ class GBLImage(FirmwareImage):
                     for tag_id, value in self.tags
                 ]
             ),
-            4,
+            block_size,
             b"\xff",
         )
 
@@ -227,7 +227,7 @@ class EBLImage(FirmwareImage):
 
         return cls(tags=tags)
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, block_size: int = 64) -> bytes:
         return pad_to_multiple(
             b"".join(
                 [
@@ -235,7 +235,7 @@ class EBLImage(FirmwareImage):
                     for tag_id, value in self.tags
                 ]
             ),
-            64,
+            block_size,
             b"\xff",
         )
 

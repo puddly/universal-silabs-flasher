@@ -5,7 +5,6 @@ import enum
 import functools
 import json
 import logging
-import os.path
 import pathlib
 import re
 import typing
@@ -16,15 +15,14 @@ import coloredlogs
 import zigpy.ota.validators
 import zigpy.types
 
-from .common import CommaSeparatedNumbers, put_first
+from .common import CommaSeparatedNumbers
 from .const import (
     DEFAULT_BAUDRATES,
     DEFAULT_PROBE_METHODS,
-    FW_IMAGE_TYPE_TO_APPLICATION_TYPE,
     ApplicationType,
     ResetTarget,
 )
-from .firmware import FirmwareImageType, GBLImage, GBLTagId, parse_firmware_image
+from .firmware import GBLImage, GBLTagId, parse_firmware_image
 from .flasher import Flasher
 from .gecko_bootloader import XMODEM_BLOCK_SIZE, ReceiverCancelled
 
@@ -462,18 +460,61 @@ async def write_ieee(ctx: click.Context, ieee: zigpy.types.EUI64, force: bool) -
 
 
 @main.command()
-@click.option("--firmware", type=click.File("rb"), required=True, show_default=True)
-@click.option("--force", is_flag=True, default=False, show_default=True)
-@click.option("--ensure-exact-version", is_flag=True, default=False, show_default=True)
-@click.option("--allow-downgrades", is_flag=True, default=False, show_default=True)
-@click.option("--allow-cross-flashing", is_flag=True, default=False, show_default=True)
-@click.option("--yellow-gpio-reset", is_flag=True, default=False, show_default=True)
-@click.option("--sonoff-reset", is_flag=True, default=False, show_default=True)
+@click.option(
+    "--firmware",
+    "firmwares",
+    type=click.File("rb"),
+    required=True,
+    show_default=True,
+    multiple=True,
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    deprecated=True,
+)
+@click.option(
+    "--ensure-exact-version",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    deprecated=True,
+)
+@click.option(
+    "--allow-downgrades",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    deprecated=True,
+)
+@click.option(
+    "--allow-cross-flashing",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    deprecated=True,
+)
+@click.option(
+    "--yellow-gpio-reset",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    deprecated=True,
+)
+@click.option(
+    "--sonoff-reset",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    deprecated=True,
+)
 @click.pass_context
 @click_coroutine
 async def flash(
     ctx: click.Context,
-    firmware: typing.BinaryIO,
+    firmwares: tuple[typing.BinaryIO, ...],
     force: bool,
     ensure_exact_version: bool,
     allow_downgrades: bool,
@@ -484,35 +525,29 @@ async def flash(
     flasher = ctx.obj["flasher"]
 
     # Parse and validate the firmware image
-    firmware_data = firmware.read()
-    firmware.close()
+    fw_images = []
 
-    try:
-        fw_image = parse_firmware_image(firmware_data)
-    except (zigpy.ota.validators.ValidationError, ValueError) as e:
-        raise click.ClickException(
-            f"{firmware.name!r} does not appear to be a valid firmware image: {e!r}"
-        )
+    for firmware_file in firmwares:
+        firmware_data = firmware_file.read()
+        firmware_file.close()
 
-    try:
-        metadata = fw_image.get_nabucasa_metadata()
-    except Exception:
-        _LOGGER.info("Failed to read firmware metadata: {exc!r}")
-        metadata = None
-    else:
-        _LOGGER.info("Extracted GBL metadata: %s", metadata)
+        try:
+            fw_image = parse_firmware_image(firmware_data)
+        except (zigpy.ota.validators.ValidationError, ValueError) as e:
+            raise click.ClickException(
+                f"{firmware_file.name!r} does not appear to be a valid firmware image:"
+                f" {e!r}"
+            )
 
-    # Prefer to probe with the current firmware's settings to speed up startup after the
-    # firmware is flashed for the first time
-    if metadata is not None and metadata.fw_type is not None:
-        app_type = FW_IMAGE_TYPE_TO_APPLICATION_TYPE[metadata.fw_type]
+        try:
+            metadata = fw_image.get_nabucasa_metadata()
+        except Exception:
+            _LOGGER.info("Failed to read firmware metadata: {exc!r}")
+            metadata = None
+        else:
+            _LOGGER.info("Extracted GBL metadata: %s", metadata)
 
-        _LOGGER.debug(
-            "Probing app type %s at %s baud first", app_type, metadata.baudrate
-        )
-        flasher._probe_methods = put_first(
-            flasher._probe_methods, [(app_type, metadata.baudrate)]
-        )
+        fw_images.append(fw_image)
 
     # Maintain backward compatibility with the deprecated reset flags
     reset_msg = (
@@ -521,86 +556,22 @@ async def flash(
     )
     if yellow_gpio_reset:
         flasher._reset_targets = [ResetTarget.YELLOW]
-        _LOGGER.info(reset_msg, "--yellow-gpio-reset")
+        _LOGGER.warning(reset_msg, "--yellow-gpio-reset")
     elif sonoff_reset:
         flasher._reset_targets = [ResetTarget.RTS_DTR]
-        _LOGGER.info(reset_msg, "--sonoff-reset")
+        _LOGGER.warning(reset_msg, "--sonoff-reset")
 
-    try:
-        await flasher.probe_app_type()
-    except RuntimeError as e:
-        raise click.ClickException(str(e)) from e
-
-    if flasher.app_type == ApplicationType.EZSP:
-        running_image_type = FirmwareImageType.ZIGBEE_NCP
-    elif flasher.app_type == ApplicationType.ROUTER:
-        running_image_type = FirmwareImageType.ZIGBEE_ROUTER
-    elif flasher.app_type == ApplicationType.SPINEL:
-        running_image_type = FirmwareImageType.OPENTHREAD_RCP
-    elif flasher.app_type == ApplicationType.CPC:
-        # TODO: how do you distinguish RCP_UART_802154 from ZIGBEE_NCP_RCP_UART_802154?
-        running_image_type = FirmwareImageType.MULTIPAN
-    elif flasher.app_type == ApplicationType.GECKO_BOOTLOADER:
-        running_image_type = None
-    else:
-        raise RuntimeError(f"Unknown application type {flasher.app_type!r}")
-
-    # Ensure the firmware versions and image types are consistent
-    if not force and flasher.app_version is not None and metadata is not None:
-        app_version = flasher.app_version
-        fw_version = metadata.get_public_version()
-
-        is_cross_flashing = (
-            metadata.fw_type is not None
-            and running_image_type is not None
-            and metadata.fw_type != running_image_type
-        )
-
-        if is_cross_flashing and not allow_cross_flashing:
-            raise click.ClickException(
-                f"Running image type {running_image_type}"
-                f" does not match firmware image type {metadata.fw_type}."
-                f" If you intend to cross-flash, run with `--allow-cross-flashing`."
-            )
-
-        if not is_cross_flashing:
-            if (
-                metadata.baudrate is not None
-                and metadata.baudrate != flasher.app_baudrate
-            ):
-                _LOGGER.info(
-                    "Firmware baudrate %s differs from expected baudrate %s",
-                    flasher.app_baudrate,
-                    metadata.baudrate,
-                )
-            elif ensure_exact_version and app_version != fw_version:
-                _LOGGER.info(
-                    "Firmware version %s does not match expected version %s",
-                    fw_version,
-                    app_version,
-                )
-            elif app_version.compatible_with(fw_version):
-                _LOGGER.info(
-                    "Firmware version %s is flashed, not re-installing", app_version
-                )
-                return
-            elif not allow_downgrades and app_version > fw_version:
-                _LOGGER.info(
-                    "Firmware version %s does not upgrade current version %s",
-                    fw_version,
-                    app_version,
-                )
-                return
-        else:
-            _LOGGER.info(
-                "Cross-flashing from %s to %s", running_image_type, metadata.fw_type
-            )
-
-    await flasher.enter_bootloader()
+    if not flasher._reset_targets:
+        try:
+            await flasher.probe_app_type()
+        except RuntimeError as e:
+            raise click.ClickException(str(e)) from e
 
     pbar = click.progressbar(
-        label=os.path.basename(firmware.name),
-        length=len(firmware_data),
+        length=sum(
+            len(fw_image.serialize(block_size=XMODEM_BLOCK_SIZE))
+            for fw_image in fw_images
+        ),
         show_eta=True,
         show_percent=True,
     )
@@ -611,8 +582,8 @@ async def flash(
 
     with pbar:
         try:
-            await flasher.flash_firmware(
-                fw_image,
+            await flasher.flash_firmwares(
+                fw_images,
                 run_firmware=True,
                 progress_callback=lambda current, _: pbar.update(XMODEM_BLOCK_SIZE),
             )
