@@ -24,7 +24,7 @@ from .const import (
     ApplicationType,
     ResetTarget,
 )
-from .firmware import FirmwareImageType, parse_firmware_image
+from .firmware import FirmwareImageType, GBLImage, GBLTagId, parse_firmware_image
 from .flasher import Flasher
 from .gecko_bootloader import XMODEM_BLOCK_SIZE, ReceiverCancelled
 
@@ -305,7 +305,8 @@ def main(
     if ctx.get_parameter_source(
         "device"
     ) == click.core.ParameterSource.DEFAULT and ctx.invoked_subcommand not in (
-        dump_gbl_metadata.name
+        dump_gbl_metadata.name,
+        combine_gbls.name,
     ):
         # Replicate the "Error: Missing option" traceback
         param = next(p for p in ctx.command.params if p.name == "device")
@@ -380,6 +381,53 @@ async def dump_gbl_metadata(ctx: click.Context, firmware: typing.BinaryIO) -> No
         _LOGGER.info("Extracted firmware metadata: %s", metadata)
 
     print(json.dumps(metadata_obj))
+
+
+@main.command()
+@click.pass_context
+@click.option("--bootloader", type=click.File("rb"), required=True, show_default=True)
+@click.option("--firmware", type=click.File("rb"), required=True, show_default=True)
+@click.option("--output", type=click.File("wb"), required=True, show_default=True)
+@click_coroutine
+async def combine_gbls(
+    ctx: click.Context,
+    bootloader: typing.BinaryIO,
+    firmware: typing.BinaryIO,
+    output: typing.BinaryIO,
+) -> None:
+    # Parse and validate the bootloader image
+    bootloader_data = bootloader.read()
+    bootloader.close()
+
+    try:
+        bootloader_image = parse_firmware_image(bootloader_data)
+    except zigpy.ota.validators.ValidationError as e:
+        raise click.ClickException(
+            f"{bootloader.name!r} does not appear to be a valid firmware image: {e!r}"
+        )
+
+    # Parse and validate the firmware image
+    firmware_data = firmware.read()
+    firmware.close()
+
+    try:
+        fw_image = parse_firmware_image(firmware_data)
+    except zigpy.ota.validators.ValidationError as e:
+        raise click.ClickException(
+            f"{firmware.name!r} does not appear to be a valid firmware image: {e!r}"
+        )
+
+    bootloader_data = bootloader_image.get_first_tag(GBLTagId.BOOTLOADER)
+    combined_image = GBLImage(
+        tags=(
+            [fw_image.tags[0], (GBLTagId.BOOTLOADER, bootloader_data)]
+            + fw_image.tags[1:-1]
+        )
+    )
+    combined_image = combined_image.regenerate_crc()
+
+    # Output the combined image to stdout
+    output.write(combined_image.serialize())
 
 
 @main.command()

@@ -4,6 +4,7 @@ import dataclasses
 import json
 import logging
 import typing
+import zlib
 
 from zigpy.ota.validators import ValidationError, parse_silabs_ebl, parse_silabs_gbl
 import zigpy.types as zigpy_t
@@ -156,6 +157,9 @@ class FirmwareImage:
         except StopIteration:
             raise KeyError(f"No tag with id {tag_id!r} exists")
 
+    def regenerate_crc(self) -> FirmwareImage:
+        raise NotImplementedError()
+
 
 @dataclasses.dataclass(frozen=True)
 class GBLImage(FirmwareImage):
@@ -189,6 +193,27 @@ class GBLImage(FirmwareImage):
 
         return NabuCasaMetadata.from_json(json.loads(metadata))
 
+    def regenerate_crc(self) -> GBLImage:
+        tags = [
+            (tag_id, value) for tag_id, value in self.tags if tag_id != GBLTagId.END
+        ]
+
+        data = b"".join(
+            [
+                tag_id.serialize() + len(value).to_bytes(4, "little") + value
+                for tag_id, value in tags + [(GBLTagId.END, b"\x00\x00\x00\x00")]
+            ]
+        )
+
+        crc = zlib.crc32(data[:-4]) & 0xFFFFFFFF
+        tags.append((GBLTagId.END, crc.to_bytes(4, "little")))
+
+        # The resulting image parses
+        result = type(self)(tags=tags)
+        assert all(parse_silabs_gbl(result.serialize()))
+
+        return result
+
 
 @dataclasses.dataclass(frozen=True)
 class EBLImage(FirmwareImage):
@@ -216,6 +241,27 @@ class EBLImage(FirmwareImage):
 
     def get_nabucasa_metadata(self) -> NabuCasaMetadata:
         raise KeyError("Metadata not supported for EBL")
+
+    def regenerate_crc(self) -> EBLImage:
+        tags = [
+            (tag_id, value) for tag_id, value in self.tags if tag_id != EBLTagId.END
+        ]
+
+        data = b"".join(
+            [
+                tag_id.serialize() + len(value).to_bytes(2, "big") + value
+                for tag_id, value in tags + [(EBLTagId.END, b"\x00\x00\x00\x00")]
+            ]
+        )
+
+        crc = zlib.crc32(data[:-4]) & 0xFFFFFFFF
+        tags.append((EBLTagId.END, crc.to_bytes(4, "little")))
+
+        # The resulting image parses
+        result = type(self)(tags=tags)
+        assert all(parse_silabs_ebl(result.serialize()))
+
+        return result
 
 
 def parse_firmware_image(data: bytes) -> FirmwareImage:
