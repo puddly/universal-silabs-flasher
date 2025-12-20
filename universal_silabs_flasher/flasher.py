@@ -419,12 +419,22 @@ class Flasher:
             zip(firmwares, firmware_sizes)
         ):
             await self.enter_bootloader()
-            await self.flash_firmware(
-                firmware,
-                run_firmware=False if index < len(firmwares) - 1 else run_firmware,
-                progress_callback=combined_progress_callback,
-            )
-            total_offset += firmware_size
+
+            if self.bootloader_baudrate is None:
+                _LOGGER.debug("Bootloader baudrate unknown, assuming 115200")
+                bootloader_baudrate = 115200
+            else:
+                bootloader_baudrate = self.bootloader_baudrate
+
+            async with self._connect_gecko_bootloader(bootloader_baudrate) as gecko:
+                await gecko.probe()
+                await gecko.upload_firmware(
+                    firmware.serialize(block_size=XMODEM_BLOCK_SIZE),
+                    progress_callback=combined_progress_callback,
+                )
+
+                if index == len(firmwares) - 1 and run_firmware:
+                    await gecko.run_firmware()
 
     async def flash_firmware(
         self,
@@ -432,21 +442,11 @@ class Flasher:
         run_firmware: bool = True,
         progress_callback: typing.Callable[[int, int], typing.Any] | None = None,
     ) -> None:
-        # Pad the image to the XMODEM block size
-        data = firmware.serialize(block_size=XMODEM_BLOCK_SIZE)
-
-        if self.bootloader_baudrate is None:
-            _LOGGER.debug("Bootloader baudrate unknown, assuming 115200")
-            bootloader_baudrate = 115200
-        else:
-            bootloader_baudrate = self.bootloader_baudrate
-
-        async with self._connect_gecko_bootloader(bootloader_baudrate) as gecko:
-            await gecko.probe()
-            await gecko.upload_firmware(data, progress_callback=progress_callback)
-
-            if run_firmware:
-                await gecko.run_firmware()
+        await self.flash_firmwares(
+            firmwares=[firmware],
+            run_firmware=run_firmware,
+            progress_callback=progress_callback,
+        )
 
     async def dump_emberznet_config(self) -> None:
         if self.app_type != ApplicationType.EZSP:
