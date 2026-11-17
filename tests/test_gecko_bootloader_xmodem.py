@@ -758,3 +758,37 @@ async def test_spurious_data_in_menu() -> None:
 
     # Should still be in IN_MENU, just ignoring the spurious data
     assert client._state_machine.state == "in_menu"
+
+
+async def test_install_bootloader() -> None:
+    """After a bootloader upload, `run` resets the device back into a bootloader."""
+    client, conversation = await create_test_pair()
+
+    info_task = asyncio.create_task(client.ebl_info())
+    await conversation.expect_command(GeckoBootloaderOption.EBL_INFO)
+    await conversation.send_menu()
+    await info_task
+
+    install_task = asyncio.create_task(client.install_bootloader())
+    await conversation.expect_command(GeckoBootloaderOption.RUN_FIRMWARE)
+    await conversation.send_menu()
+
+    async with asyncio.timeout(1):
+        await install_task
+
+
+@patch("universal_silabs_flasher.gecko_bootloader.BOOTLOADER_INSTALL_TIMEOUT", 0.1)
+async def test_install_bootloader_timeout() -> None:
+    """No bootloader menu after installing a bootloader is an error."""
+    client, conversation = await create_test_pair()
+
+    info_task = asyncio.create_task(client.ebl_info())
+    await conversation.expect_command(GeckoBootloaderOption.EBL_INFO)
+    await conversation.send_menu()
+    await info_task
+
+    install_task = asyncio.create_task(client.install_bootloader())
+    await conversation.expect_command(GeckoBootloaderOption.RUN_FIRMWARE)
+
+    with pytest.raises(TimeoutError):
+        await install_task

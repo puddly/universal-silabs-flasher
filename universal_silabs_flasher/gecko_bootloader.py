@@ -27,6 +27,7 @@ class ReceiverCancelled(UploadError):
     """Receiver cancelled the transmission with a `CAN` status."""
 
 
+BOOTLOADER_INSTALL_TIMEOUT = 10.0
 MENU_AFTER_UPLOAD_TIMEOUT = 1.0
 MENU_QUIET_PERIOD = 0.2
 RUN_APPLICATION_DELAY = 2.0
@@ -192,6 +193,19 @@ class GeckoBootloaderProtocol(SerialProtocol):
             return
         else:
             raise NoFirmwareError("No firmware exists on the device")
+
+    async def install_bootloader(self) -> None:
+        """Select `run` after a bootloader upload and wait for the bootloader menu."""
+        await self._state_machine.wait_for_state(State.IN_MENU)
+
+        # Staging the bootloader invalidates the application. A newer bootloader is
+        # installed by the Secure Engine, an older one is ignored, and either way the
+        # device resets back into a bootloader.
+        self._state_machine.state = State.WAITING_FOR_MENU
+        self.send_data(GeckoBootloaderOption.RUN_FIRMWARE)
+
+        async with asyncio.timeout(BOOTLOADER_INSTALL_TIMEOUT):
+            await self._state_machine.wait_for_state(State.IN_MENU)
 
     def _xmodem_timeout_cb(self) -> None:
         """XMODEM receive timeout."""
