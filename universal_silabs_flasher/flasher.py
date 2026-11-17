@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import logging
 import typing
 from typing import cast
@@ -11,7 +12,7 @@ from aiospinel import PropertyStatusError, SpinelProtocol
 import bellows.config
 import bellows.ezsp
 import bellows.types
-from pygbl import FirmwareImage
+from pygbl import FirmwareImage, GBL3Header, GBL3Image, GBL3Type
 import zigpy.serial
 import zigpy.types
 
@@ -449,10 +450,12 @@ class BaseFlasher:
         run_firmware: bool = True,
         progress_callback: typing.Callable[[int, int], typing.Any] | None = None,
     ) -> None:
-        data = firmware.serialize()
-
-        # Pad the image to the XMODEM block size
-        data = pad_to_multiple(data, XMODEM_BLOCK_SIZE, b"\xff")
+        # Pad each image to the XMODEM block size
+        uploads = [
+            pad_to_multiple(image.serialize(), XMODEM_BLOCK_SIZE, b"\xff")
+            for image in split_combined_firmware(firmware)
+        ]
+        total_size = sum(len(data) for data in uploads)
 
         if self.bootloader_baudrate is None:
             _LOGGER.debug("Bootloader baudrate unknown, assuming 115200")
@@ -462,10 +465,54 @@ class BaseFlasher:
 
         async with self._connect_gecko_bootloader(bootloader_baudrate) as gecko:
             await gecko.probe()
-            await gecko.upload_firmware(data, progress_callback=progress_callback)
+            offset = 0
+
+            for index, data in enumerate(uploads):
+                if index > 0:
+                    _LOGGER.info("Installing the bootloader")
+                    await gecko.install_bootloader()
+
+                upload_progress_callback = None
+
+                if progress_callback is not None:
+                    upload_progress_callback = functools.partial(
+                        _offset_progress, progress_callback, offset, total_size
+                    )
+
+                await gecko.upload_firmware(
+                    data, progress_callback=upload_progress_callback
+                )
+                offset += len(data)
 
             if run_firmware:
                 await gecko.run_firmware()
+
+
+def _offset_progress(
+    progress_callback: typing.Callable[[int, int], typing.Any],
+    offset: int,
+    total: int,
+    current: int,
+    _upload_total: int,
+) -> typing.Any:
+    """Report the progress of one upload as part of all uploads."""
+    return progress_callback(offset + current, total)
+
+
+def split_combined_firmware(firmware: FirmwareImage) -> list[FirmwareImage]:
+    """Split a combined bootloader + application image into its bootloader and app."""
+    # In one upload, stock bootloaders install the application over the staged
+    # bootloader. Separate uploads install both.
+    if not isinstance(firmware, GBL3Image):
+        return [firmware]
+
+    # Signed or encrypted images can't be split without breaking them
+    if firmware.get_first_tag(GBL3Header).type != GBL3Type.NONE:
+        return [firmware]
+
+    images: list[FirmwareImage] = firmware.split_bootloader_app()
+
+    return images
 
 
 class Flasher(BaseFlasher):

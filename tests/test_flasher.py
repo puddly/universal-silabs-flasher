@@ -1,13 +1,23 @@
 import asyncio
-from collections.abc import Generator
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from collections.abc import Callable, Generator
+import dataclasses
+import pathlib
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 from aiospinel import PropertyStatusError, Status
+from pygbl import (
+    BootloaderVersion,
+    GBL3Bootloader,
+    GBL3Header,
+    GBL3Image,
+    GBL3Type,
+    parse_firmware_image,
+)
 import pytest
 import zigpy.serial
 import zigpy.types as t
 
-from universal_silabs_flasher.common import Version
+from universal_silabs_flasher.common import Version, pad_to_multiple
 from universal_silabs_flasher.const import (
     RESET_CONFIGS,
     SPINEL_PROP_VENDOR_ZIGGURAT,
@@ -26,7 +36,56 @@ from universal_silabs_flasher.flasher import (
     Zbt1Flasher,
     Zbt2Flasher,
 )
-from universal_silabs_flasher.gecko_bootloader import GeckoBootloaderProtocol
+from universal_silabs_flasher.gecko_bootloader import (
+    XMODEM_BLOCK_SIZE,
+    GeckoBootloaderProtocol,
+)
+
+APP_FIRMWARE = parse_firmware_image(
+    (
+        pathlib.Path(__file__).parent / "firmwares/skyconnect_zigbee_ncp_7.4.4.0.gbl"
+    ).read_bytes()
+)
+
+
+def make_combined_firmware() -> GBL3Image:
+    bootloader = GBL3Image(
+        tags=[
+            APP_FIRMWARE.get_first_tag(GBL3Header),
+            GBL3Bootloader(
+                version=BootloaderVersion(major=3, minor=3, customer=0),
+                address=0x00000000,
+                data=b"\xab" * 1024,
+            ),
+        ]
+    ).regenerate_crc()
+
+    return APP_FIRMWARE.combine_bootloader_app(bootloader)
+
+
+def padded(image: GBL3Image) -> bytes:
+    return pad_to_multiple(image.serialize(), XMODEM_BLOCK_SIZE, b"\xff")
+
+
+async def flash_with_mock_bootloader(
+    flasher: Flasher, firmware: GBL3Image, progress_callback: MagicMock | None = None
+) -> AsyncMock:
+    gecko = AsyncMock()
+
+    async def upload_firmware(
+        data: bytes, *, progress_callback: Callable[[int, int], None] | None
+    ) -> None:
+        if progress_callback is not None:
+            progress_callback(0, len(data))
+            progress_callback(len(data), len(data))
+
+    gecko.upload_firmware.side_effect = upload_firmware
+
+    with patch.object(flasher, "_connect_gecko_bootloader") as mock_connect:
+        mock_connect.return_value.__aenter__.return_value = gecko
+        await flasher.flash_firmware(firmware, progress_callback=progress_callback)
+
+    return gecko
 
 
 @pytest.fixture(autouse=True)
@@ -523,3 +582,65 @@ async def test_enter_bootloader_from_application():
 
     assert flasher.bootloader_baudrate == 115200
     assert len(mock_cpc.enter_bootloader.mock_calls) == 1
+
+
+async def test_flash_firmware_single_image() -> None:
+    flasher = Flasher(device="/dev/ttyMOCK")
+    gecko = await flash_with_mock_bootloader(flasher, APP_FIRMWARE)
+
+    assert gecko.mock_calls == [
+        call.probe(),
+        call.upload_firmware(padded(APP_FIRMWARE), progress_callback=None),
+        call.run_firmware(),
+    ]
+
+
+async def test_flash_firmware_combined_is_split() -> None:
+    """A combined image is uploaded as its bootloader, then its application."""
+    flasher = Flasher(device="/dev/ttyMOCK")
+    combined = make_combined_firmware()
+    bootloader, app = combined.split_bootloader_app()
+    bootloader_data, app_data = padded(bootloader), padded(app)
+    progress_callback = MagicMock()
+
+    gecko = await flash_with_mock_bootloader(flasher, combined, progress_callback)
+
+    assert gecko.mock_calls == [
+        call.probe(),
+        call.upload_firmware(bootloader_data, progress_callback=ANY),
+        call.install_bootloader(),
+        call.upload_firmware(app_data, progress_callback=ANY),
+        call.run_firmware(),
+    ]
+
+    # Progress covers both uploads
+    total = len(bootloader_data) + len(app_data)
+    assert progress_callback.mock_calls == [
+        call(0, total),
+        call(len(bootloader_data), total),
+        call(len(bootloader_data), total),
+        call(total, total),
+    ]
+
+
+async def test_flash_firmware_signed_combined_is_not_split() -> None:
+    """Signed or encrypted combined images can't be split and are uploaded as is."""
+    flasher = Flasher(device="/dev/ttyMOCK")
+    combined = make_combined_firmware()
+    signed = dataclasses.replace(
+        combined,
+        tags=[
+            dataclasses.replace(tag, type=GBL3Type.SIGNATURE_ECDSA_P256)
+            if isinstance(tag, GBL3Header)
+            else tag
+            for tag in combined.tags
+        ],
+    )
+
+    gecko = await flash_with_mock_bootloader(flasher, signed)
+
+    assert gecko.mock_calls == [
+        call.probe(),
+        call.upload_firmware(padded(signed), progress_callback=None),
+        call.run_firmware(),
+    ]
