@@ -31,7 +31,10 @@ MENU_AFTER_UPLOAD_TIMEOUT = 1.0
 MENU_QUIET_PERIOD = 0.2
 RUN_APPLICATION_DELAY = 2.0
 XMODEM_BLOCK_SIZE = 128
-XMODEM_RECEIVE_TIMEOUT = 2
+
+# The bootloader waits 3s for the rest of a partially received packet. Retrying before
+# then appends the retry to the partial packet, which desynchronizes the transfer.
+XMODEM_RECEIVE_TIMEOUT = 4
 
 
 class XModemPacketType(zigpy.types.enum8):

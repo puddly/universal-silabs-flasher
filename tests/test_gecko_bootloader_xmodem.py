@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import pathlib
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -227,6 +227,7 @@ async def test_xmodem_with_retries() -> None:
     assert received_firmware == FIRMWARE
 
 
+@patch("universal_silabs_flasher.gecko_bootloader.XMODEM_RECEIVE_TIMEOUT", 0.5)
 async def test_xmodem_timeout() -> None:
     """Test an XMODEM transfer with a receive timeout on the server side."""
     client, conversation = await create_test_pair()
@@ -249,7 +250,7 @@ async def test_xmodem_timeout() -> None:
 
     # Do not reply to the second packet to trigger a timeout
     await conversation.expect_packet(number=2)
-    payload = await conversation.expect_packet(number=2, timeout=3.0)
+    payload = await conversation.expect_packet(number=2, timeout=1.0)
     received_firmware.extend(payload)
     await conversation.send_ack()
 
