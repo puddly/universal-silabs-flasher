@@ -28,6 +28,7 @@ class ReceiverCancelled(UploadError):
 
 
 MENU_AFTER_UPLOAD_TIMEOUT = 1.0
+MENU_QUIET_PERIOD = 0.2
 RUN_APPLICATION_DELAY = 2.0
 XMODEM_BLOCK_SIZE = 128
 XMODEM_RECEIVE_TIMEOUT = 2
@@ -104,6 +105,7 @@ class GeckoBootloaderProtocol(SerialProtocol):
         self._version: str | None = None
         self._upload_status: str | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
+        self._last_data_time = float("-inf")
 
         # XMODEM state
         self._xmodem_firmware: bytes | None = None
@@ -150,8 +152,26 @@ class GeckoBootloaderProtocol(SerialProtocol):
 
         await self._state_machine.wait_for_state(State.IN_MENU)
 
+        # The Gecko bootloader prints a menu for both the newline and the command. Let
+        # the second one finish so that it is not mistaken for a later response.
+        await self._wait_until_quiet()
+
         assert self._version is not None
         return Version(self._version)
+
+    async def _wait_until_quiet(self) -> None:
+        """Wait until the bootloader stops sending data, then discard it."""
+        assert self.loop is not None
+
+        while True:
+            remaining = self._last_data_time + MENU_QUIET_PERIOD - self.loop.time()
+
+            if remaining <= 0:
+                break
+
+            await asyncio.sleep(remaining)
+
+        self._buffer.clear()
 
     async def run_firmware(self) -> None:
         """Select `run` in the menu."""
@@ -337,6 +357,8 @@ class GeckoBootloaderProtocol(SerialProtocol):
 
     def data_received(self, data: bytes) -> None:
         super().data_received(data)
+        assert self.loop is not None
+        self._last_data_time = self.loop.time()
 
         if self._state_machine.state == State.XMODEM_UPLOADING:
             self._handle_xmodem_response()
