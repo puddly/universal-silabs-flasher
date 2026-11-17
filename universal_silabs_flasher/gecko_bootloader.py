@@ -47,6 +47,7 @@ class XModemPacketType(zigpy.types.enum8):
     ETB = 0x17  # End of Transmission Block
     ACK = 0x06  # Acknowledge
     NAK = 0x15  # Not Acknowledge
+    C = 0x43  # Receiver is ready for the first block, with a CRC
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,6 +328,15 @@ class GeckoBootloaderProtocol(SerialProtocol):
         if self._xmodem_timeout_handle is None:
             _LOGGER.debug("Ignoring spurious XMODEM data: %r", self._buffer)
             self._buffer.clear()
+            return
+
+        # The receiver repeats `C` until it sees the first block, so a repeat can arrive
+        # after we sent it. It does not answer the block: resending on it would make
+        # the receiver ACK twice and our ACKs would no longer match our blocks.
+        if self._buffer[0] == XModemPacketType.C:
+            _LOGGER.debug("Ignoring late XMODEM start request")
+            self._buffer = self._buffer[1:]
+            self._handle_xmodem_response()
             return
 
         # We are waiting for a response, so cancel the timeout

@@ -792,3 +792,42 @@ async def test_install_bootloader_timeout() -> None:
 
     with pytest.raises(TimeoutError):
         await install_task
+
+
+async def test_xmodem_late_c_is_ignored() -> None:
+    """A `C` repeated before the receiver saw the first block does not resend it."""
+    client, conversation = await create_test_pair()
+    received_firmware = bytearray()
+
+    upload_task = asyncio.create_task(client.upload_firmware(FIRMWARE))
+
+    await conversation.expect_command(GeckoBootloaderOption.EBL_INFO)
+    await conversation.send_menu()
+
+    await conversation.expect_command(GeckoBootloaderOption.UPLOAD_FIRMWARE)
+    await conversation.send(b"C")
+
+    payload = await conversation.expect_packet(number=1)
+    received_firmware.extend(payload)
+
+    # The receiver sent another `C` before the first block arrived
+    await conversation.send(b"C")
+    await conversation.send_ack()
+
+    # The next packet is the second one, not a resend of the first
+    for i in range(1, len(FIRMWARE) // XMODEM_BLOCK_SIZE):
+        payload = await conversation.expect_packet(number=(i + 1) & 0xFF)
+        received_firmware.extend(payload)
+        await conversation.send_ack()
+
+    await conversation.expect_eot()
+    await conversation.send_ack()
+    await conversation.send_upload_complete()
+
+    await conversation.expect_command(GeckoBootloaderOption.EBL_INFO)
+    await conversation.send_menu()
+
+    async with asyncio.timeout(UPLOAD_COMPLETION_TIMEOUT):
+        await upload_task
+
+    assert received_firmware == FIRMWARE
