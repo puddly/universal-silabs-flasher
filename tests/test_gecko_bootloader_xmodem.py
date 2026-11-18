@@ -9,6 +9,7 @@ import pytest
 
 from universal_silabs_flasher.common import crc16_ccitt, pad_to_multiple
 from universal_silabs_flasher.gecko_bootloader import (
+    MENU_QUIET_PERIOD,
     XMODEM_BLOCK_SIZE,
     GeckoBootloaderOption,
     GeckoBootloaderProtocol,
@@ -831,3 +832,30 @@ async def test_xmodem_late_c_is_ignored() -> None:
         await upload_task
 
     assert received_firmware == FIRMWARE
+
+
+async def test_ebl_info_ignores_stale_menu() -> None:
+    """A menu received before `ebl_info` does not answer it."""
+    client, conversation = await create_test_pair()
+
+    info_task = asyncio.create_task(client.ebl_info())
+    await conversation.expect_command(GeckoBootloaderOption.EBL_INFO)
+    await conversation.send_menu()
+    await info_task
+
+    # A menu arrives while nothing is waiting for one, so it stays buffered
+    await conversation.send_menu()
+    await asyncio.sleep(0.05)
+
+    info_task = asyncio.create_task(client.ebl_info())
+    await conversation.expect_command(GeckoBootloaderOption.EBL_INFO)
+
+    # Unrelated data must not make the old menu count as the answer
+    await conversation.send(b"\x00")
+    await asyncio.sleep(MENU_QUIET_PERIOD + 0.1)
+    assert not info_task.done()
+
+    await conversation.send_menu()
+
+    async with asyncio.timeout(1):
+        await info_task

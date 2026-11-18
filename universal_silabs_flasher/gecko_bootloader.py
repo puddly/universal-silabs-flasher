@@ -151,6 +151,9 @@ class GeckoBootloaderProtocol(SerialProtocol):
         """Select `ebl info` in the menu and return the bootloader version."""
         self._state_machine.state = State.WAITING_FOR_MENU
 
+        # Anything received before this can't be the answer to it
+        self._buffer.clear()
+
         # Ember bootloader requires a newline
         self.send_data(b"\n")
         self.send_data(GeckoBootloaderOption.EBL_INFO)
