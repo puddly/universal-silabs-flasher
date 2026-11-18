@@ -55,9 +55,17 @@ MENU_QUIET_PERIOD = 0.2
 RUN_APPLICATION_DELAY = 2.0
 XMODEM_BLOCK_SIZE = 128
 
+# The bootloader answers `upload gbl` with `begin upload` and a `C` within milliseconds
+XMODEM_START_TIMEOUT = 5.0
+
 # The bootloader waits 3s for the rest of a partially received packet. Retrying before
 # then appends the retry to the partial packet, which desynchronizes the transfer.
 XMODEM_RECEIVE_TIMEOUT = 4
+
+# A `CAN` that lands inside a partially received packet only becomes part of it, so
+# send it again once the bootloader has given up on that packet
+XMODEM_CANCEL_ATTEMPTS = 3
+XMODEM_CANCEL_TIMEOUT = 4
 
 
 class XModemPacketType(zigpy.types.enum8):
@@ -296,7 +304,28 @@ class GeckoBootloaderProtocol(SerialProtocol):
         progress_callback: typing.Callable[[int, int], typing.Any] | None = None,
     ) -> None:
         """Select `upload gbl` in the menu and upload GBL firmware."""
-        await self.ebl_info()
+        try:
+            await self._upload_firmware_attempt(
+                firmware,
+                max_failures=max_failures,
+                progress_callback=progress_callback,
+            )
+        except ReceiverCancelled:
+            raise
+        except UploadError:
+            # The bootloader may still be waiting for blocks
+            await self._cancel_transfer()
+            raise
+
+    async def _upload_firmware_attempt(
+        self,
+        firmware: bytes,
+        *,
+        max_failures: int,
+        progress_callback: typing.Callable[[int, int], typing.Any] | None,
+    ) -> None:
+        """Upload the firmware once."""
+        await self.probe()
 
         self._upload_status = None
         self._upload_error = None
@@ -306,7 +335,11 @@ class GeckoBootloaderProtocol(SerialProtocol):
         self.send_data(GeckoBootloaderOption.UPLOAD_FIRMWARE)
 
         # Wait for the XMODEM `C` byte
-        await self._state_machine.wait_for_state(State.XMODEM_UPLOADING)
+        try:
+            async with asyncio.timeout(XMODEM_START_TIMEOUT):
+                await self._state_machine.wait_for_state(State.XMODEM_UPLOADING)
+        except TimeoutError as exc:
+            raise UploadError("The bootloader did not start the transfer") from exc
 
         # Set up XMODEM state
         self._xmodem_firmware = firmware
@@ -351,7 +384,26 @@ class GeckoBootloaderProtocol(SerialProtocol):
                 await self._state_machine.wait_for_state(State.IN_MENU)
         except TimeoutError:
             # If not, trigger it manually
-            await self.ebl_info()
+            await self.probe()
+
+    async def _cancel_transfer(self) -> None:
+        """Leave an unfinished XMODEM transfer and return to the menu."""
+        for attempt in range(1, XMODEM_CANCEL_ATTEMPTS + 1):
+            self._state_machine.state = State.WAITING_FOR_MENU
+            self._buffer.clear()
+            self.send_data(bytes([XModemPacketType.CAN]))
+
+            try:
+                async with asyncio.timeout(XMODEM_CANCEL_TIMEOUT):
+                    await self._state_machine.wait_for_state(State.IN_MENU)
+            except TimeoutError:
+                _LOGGER.debug("No menu after cancelling the transfer (%d)", attempt)
+                continue
+
+            await self._wait_until_quiet()
+            return
+
+        _LOGGER.warning("The bootloader did not return to its menu after cancelling")
 
     def send_data(self, data: bytes) -> None:
         assert self._transport is not None

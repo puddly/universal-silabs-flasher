@@ -92,6 +92,11 @@ class Conversation(asyncio.Protocol):
         )
         await self.send_menu()
 
+    async def expect_can(self, timeout: float = 1.0) -> None:
+        async with asyncio.timeout(timeout):
+            data = await self._reader.read(1)
+        assert data == bytes([XModemPacketType.CAN])
+
     async def expect_command(
         self,
         command: GeckoBootloaderOption,
@@ -316,7 +321,7 @@ async def test_xmodem_cancellation() -> None:
 
 
 async def test_xmodem_too_many_retries() -> None:
-    """Test an XMODEM transfer that fails after too many retries."""
+    """After too many failures, the transfer is cancelled before giving up."""
     client, conversation = await create_test_pair()
 
     upload_task = asyncio.create_task(client.upload_firmware(FIRMWARE, max_failures=3))
@@ -334,8 +339,13 @@ async def test_xmodem_too_many_retries() -> None:
         await conversation.expect_packet(number=1)
         await conversation.send_nak()
 
-    with pytest.raises(UploadError):
-        await upload_task
+    # The client leaves the transfer, so the bootloader is back in its menu
+    await conversation.expect_can()
+    await conversation.send_upload_aborted("block", 0x18)
+
+    with pytest.raises(UploadError, match="Received 3 consecutive failures"):
+        async with asyncio.timeout(UPLOAD_COMPLETION_TIMEOUT):
+            await upload_task
 
 
 async def test_xmodem_ack_with_garbage() -> None:
@@ -629,6 +639,9 @@ async def test_xmodem_abort_with_pending_timeout() -> None:
     error = UploadError("Manual abort test")
     client._xmodem_abort(error)
 
+    await conversation.expect_can()
+    await conversation.send_upload_aborted("block", 0x18)
+
     # The upload should fail with our error
     with pytest.raises(UploadError, match="Manual abort test"):
         await upload_task
@@ -863,6 +876,51 @@ async def test_xmodem_late_c_is_ignored() -> None:
         await upload_task
 
     assert received_firmware == FIRMWARE
+
+
+@patch("universal_silabs_flasher.gecko_bootloader.XMODEM_CANCEL_TIMEOUT", 0.2)
+async def test_xmodem_cancel_is_resent() -> None:
+    """A `CAN` swallowed by a partial packet is sent again."""
+    client, conversation = await create_test_pair()
+
+    upload_task = asyncio.create_task(client.upload_firmware(FIRMWARE, max_failures=0))
+
+    await conversation.expect_command(GeckoBootloaderOption.EBL_INFO)
+    await conversation.send_menu()
+    await conversation.expect_command(GeckoBootloaderOption.UPLOAD_FIRMWARE)
+    await conversation.send(b"C")
+
+    await conversation.expect_packet(number=1)
+    await conversation.send_nak()
+
+    # The first `CAN` becomes part of a partial packet and goes unanswered
+    await conversation.expect_can()
+    await conversation.expect_can()
+    await conversation.send_upload_aborted("block", 0x18)
+
+    with pytest.raises(UploadError, match="Received 0 consecutive failures"):
+        async with asyncio.timeout(UPLOAD_COMPLETION_TIMEOUT):
+            await upload_task
+
+
+@patch("universal_silabs_flasher.gecko_bootloader.XMODEM_START_TIMEOUT", 0.2)
+async def test_xmodem_no_start_request() -> None:
+    """If the bootloader never asks for the first block, the transfer is cancelled."""
+    client, conversation = await create_test_pair()
+
+    upload_task = asyncio.create_task(client.upload_firmware(FIRMWARE))
+
+    await conversation.expect_command(GeckoBootloaderOption.EBL_INFO)
+    await conversation.send_menu()
+    await conversation.expect_command(GeckoBootloaderOption.UPLOAD_FIRMWARE)
+
+    # No `C`: the client leaves the menu option and gives up
+    await conversation.expect_can()
+    await conversation.send_menu()
+
+    with pytest.raises(UploadError, match="did not start the transfer"):
+        async with asyncio.timeout(UPLOAD_COMPLETION_TIMEOUT):
+            await upload_task
 
 
 async def test_xmodem_stale_responses_are_discarded() -> None:
