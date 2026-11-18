@@ -323,67 +323,79 @@ class GeckoBootloaderProtocol(SerialProtocol):
         self._transport.write(data)
 
     def _handle_xmodem_response(self) -> None:
-        """Handle a single byte response from the receiver."""
-        if not self._buffer:
-            return
-
-        # If we are not waiting for a response, this is spurious data
-        if self._xmodem_timeout_handle is None:
-            _LOGGER.debug("Ignoring spurious XMODEM data: %r", self._buffer)
-            self._buffer.clear()
-            return
-
-        # The receiver repeats `C` until it sees the first block, so a repeat can arrive
-        # after we sent it. It does not answer the block: resending on it would make
-        # the receiver ACK twice and our ACKs would no longer match our blocks.
-        if self._buffer[0] == XModemPacketType.C:
-            _LOGGER.debug("Ignoring late XMODEM start request")
-            self._buffer = self._buffer[1:]
-            self._handle_xmodem_response()
-            return
-
-        # We are waiting for a response, so cancel the timeout
-        self._xmodem_timeout_handle.cancel()
-        self._xmodem_timeout_handle = None
-
-        response = self._buffer[0]
-        self._buffer = self._buffer[1:]
-
-        if response == XModemPacketType.ACK:
-            if self._xmodem_chunk_index >= self._xmodem_total_chunks:
-                # EOT was ACKed - keep buffer intact as upload complete/menu may follow
-                if (
-                    self._xmodem_completion_future
-                    and not self._xmodem_completion_future.done()
-                ):
-                    self._xmodem_completion_future.set_result(None)
-                self._state_machine.state = State.WAITING_UPLOAD_DONE
-                # Process the rest of the buffer for the upload complete message
-                self.data_received(b"")
+        """Handle the receiver's response to the last block."""
+        while self._buffer:
+            # If we are not waiting for a response, this is spurious data
+            if self._xmodem_timeout_handle is None:
+                _LOGGER.debug("Ignoring spurious XMODEM data: %r", self._buffer)
+                self._buffer.clear()
                 return
 
-            assert self._xmodem_firmware is not None
-            offset = (self._xmodem_chunk_index + 1) * XMODEM_BLOCK_SIZE
-            if self._xmodem_progress_callback is not None:
-                self._xmodem_progress_callback(offset, len(self._xmodem_firmware))
+            response = self._buffer.pop(0)
 
-            _LOGGER.debug(
-                "Firmware upload progress: %0.2f%%",
-                100 * offset / len(self._xmodem_firmware),
-            )
+            if response in (
+                XModemPacketType.ACK,
+                XModemPacketType.NAK,
+                XModemPacketType.CAN,
+            ):
+                self._xmodem_timeout_handle.cancel()
+                self._xmodem_timeout_handle = None
 
-            self._xmodem_chunk_index += 1
-            self._xmodem_retries = 0
-            self._xmodem_send_chunk_or_eot()
-        elif response == XModemPacketType.NAK:
-            _LOGGER.debug("Got a NAK, retrying")
-            self._xmodem_retry_chunk()
-        elif response == XModemPacketType.CAN:
-            self._xmodem_abort(ReceiverCancelled())
-        else:
-            _LOGGER.warning("Invalid XMODEM response: %r", response)
-            # Treat as a failure and retry
-            self._xmodem_retry_chunk()
+            if response == XModemPacketType.ACK:
+                self._handle_xmodem_ack()
+                return
+            elif response == XModemPacketType.NAK:
+                _LOGGER.debug("Got a NAK, retrying")
+                self._discard_stale_responses()
+                self._xmodem_retry_chunk()
+                return
+            elif response == XModemPacketType.CAN:
+                self._xmodem_abort(ReceiverCancelled())
+                return
+
+            # Anything else does not answer the block. If the block arrived, resending
+            # it would make the receiver ACK twice, and our ACKs would no longer match
+            # our blocks. A lost response is handled by the timeout.
+            if response == XModemPacketType.C:
+                # The receiver repeats `C` until it sees the first block
+                _LOGGER.debug("Ignoring late XMODEM start request")
+            else:
+                _LOGGER.warning("Ignoring invalid XMODEM response: %r", response)
+
+    def _handle_xmodem_ack(self) -> None:
+        """Send the next block, or finish the transfer once EOT was ACKed."""
+        if self._xmodem_chunk_index >= self._xmodem_total_chunks:
+            # EOT was ACKed - keep buffer intact as upload complete/menu may follow
+            if (
+                self._xmodem_completion_future
+                and not self._xmodem_completion_future.done()
+            ):
+                self._xmodem_completion_future.set_result(None)
+            self._state_machine.state = State.WAITING_UPLOAD_DONE
+            # Process the rest of the buffer for the upload complete message
+            self.data_received(b"")
+            return
+
+        assert self._xmodem_firmware is not None
+        offset = (self._xmodem_chunk_index + 1) * XMODEM_BLOCK_SIZE
+        if self._xmodem_progress_callback is not None:
+            self._xmodem_progress_callback(offset, len(self._xmodem_firmware))
+
+        _LOGGER.debug(
+            "Firmware upload progress: %0.2f%%",
+            100 * offset / len(self._xmodem_firmware),
+        )
+
+        self._xmodem_chunk_index += 1
+        self._xmodem_retries = 0
+        self._discard_stale_responses()
+        self._xmodem_send_chunk_or_eot()
+
+    def _discard_stale_responses(self) -> None:
+        """Drop data received before the next block is sent: it can't answer it."""
+        if self._buffer:
+            _LOGGER.debug("Discarding stale XMODEM data: %r", self._buffer)
+            self._buffer.clear()
 
     def data_received(self, data: bytes) -> None:
         super().data_received(data)

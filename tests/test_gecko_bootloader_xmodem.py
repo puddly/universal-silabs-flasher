@@ -322,8 +322,9 @@ async def test_xmodem_too_many_retries() -> None:
 
 
 async def test_xmodem_ack_with_garbage() -> None:
-    """Test that the client handles invalid XMODEM responses."""
+    """Invalid responses are ignored instead of resending the block."""
     client, conversation = await create_test_pair()
+    received_firmware = bytearray()
 
     upload_task = asyncio.create_task(client.upload_firmware(FIRMWARE))
 
@@ -335,18 +336,27 @@ async def test_xmodem_ack_with_garbage() -> None:
     await conversation.expect_command(GeckoBootloaderOption.UPLOAD_FIRMWARE)
     await conversation.send(b"C")
 
-    # First packet is OK
-    await conversation.expect_packet(number=1)
+    received_firmware.extend(await conversation.expect_packet(number=1))
     await conversation.send_ack()
 
-    # Send invalid responses (not ACK, NAK, or CAN) - should retry and eventually fail
-    for i in range(4):
-        await conversation.expect_packet(number=2)
-        await conversation.send(b"\xff")  # Invalid response
+    # Noise before the ACK: resending packet 2 would make the receiver ACK it twice
+    received_firmware.extend(await conversation.expect_packet(number=2))
+    await conversation.send(b"\xff")
+    await conversation.send_ack()
 
-    # The upload fails due to too many retries
-    with pytest.raises(UploadError, match="Received 3 consecutive failures"):
+    for i in range(2, len(FIRMWARE) // XMODEM_BLOCK_SIZE):
+        received_firmware.extend(await conversation.expect_packet(number=i + 1))
+        await conversation.send_ack()
+
+    await conversation.expect_eot()
+    await conversation.send_ack()
+    await conversation.send_upload_complete()
+    await conversation.send_menu()
+
+    async with asyncio.timeout(UPLOAD_COMPLETION_TIMEOUT):
         await upload_task
+
+    assert received_firmware == FIRMWARE
 
 
 async def test_xmodem_multiple_c_bytes() -> None:
@@ -826,6 +836,37 @@ async def test_xmodem_late_c_is_ignored() -> None:
     await conversation.send_upload_complete()
 
     await conversation.expect_command(GeckoBootloaderOption.EBL_INFO)
+    await conversation.send_menu()
+
+    async with asyncio.timeout(UPLOAD_COMPLETION_TIMEOUT):
+        await upload_task
+
+    assert received_firmware == FIRMWARE
+
+
+async def test_xmodem_stale_responses_are_discarded() -> None:
+    """Data received before a block was sent is not taken as its response."""
+    client, conversation = await create_test_pair()
+    received_firmware = bytearray()
+
+    upload_task = asyncio.create_task(client.upload_firmware(FIRMWARE))
+
+    await conversation.expect_command(GeckoBootloaderOption.EBL_INFO)
+    await conversation.send_menu()
+    await conversation.expect_command(GeckoBootloaderOption.UPLOAD_FIRMWARE)
+    await conversation.send(b"C")
+
+    # An ACK followed by a NAK in the same chunk: the NAK predates packet 2
+    received_firmware.extend(await conversation.expect_packet(number=1))
+    await conversation.send(bytes([XModemPacketType.ACK, XModemPacketType.NAK]))
+
+    for i in range(1, len(FIRMWARE) // XMODEM_BLOCK_SIZE):
+        received_firmware.extend(await conversation.expect_packet(number=i + 1))
+        await conversation.send_ack()
+
+    await conversation.expect_eot()
+    await conversation.send_ack()
+    await conversation.send_upload_complete()
     await conversation.send_menu()
 
     async with asyncio.timeout(UPLOAD_COMPLETION_TIMEOUT):
