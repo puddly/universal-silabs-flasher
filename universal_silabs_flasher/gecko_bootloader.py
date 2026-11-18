@@ -15,6 +15,24 @@ from .common import PROBE_TIMEOUT, StateMachine, Version, crc16_ccitt
 _LOGGER = logging.getLogger(__name__)
 
 
+class BootloaderErrorKind(enum.StrEnum):
+    # XMODEM communication error
+    BLOCK = "block"
+    # The image was rejected, e.g. because of its CRC or signature
+    FILE = "file"
+
+
+@dataclasses.dataclass(frozen=True)
+class BootloaderError:
+    """Error the bootloader prints when it aborts an upload."""
+
+    kind: BootloaderErrorKind
+    code: int
+
+    def __str__(self) -> str:
+        return f"{self.kind} error 0x{self.code:02X}"
+
+
 class UploadError(Exception):
     pass
 
@@ -25,6 +43,10 @@ class NoFirmwareError(Exception):
 
 class ReceiverCancelled(UploadError):
     """Receiver cancelled the transmission with a `CAN` status."""
+
+    def __init__(self, error: BootloaderError | None = None) -> None:
+        super().__init__(str(error) if error is not None else "Upload cancelled")
+        self.error = error
 
 
 BOOTLOADER_INSTALL_TIMEOUT = 10.0
@@ -76,11 +98,12 @@ MENU_REGEX = re.compile(
     rb"BL > "
 )
 
-UPLOAD_STATUS_REGEX = re.compile(
-    rb"\r\nSerial upload (?P<status>complete|aborted)\r\n"
-    rb"(?P<message>.*?)\x00?",
-    flags=re.DOTALL,
-)  # fmt: skip
+UPLOAD_STATUS_REGEX = re.compile(rb"\r\nSerial upload (?P<status>complete|aborted)\r\n")
+
+# The bootloader prints the NUL that ends `0x` before the error code
+UPLOAD_ERROR_REGEX = re.compile(
+    rb"\r\n(?P<kind>block|file) error 0x\x00?(?P<code>[0-9A-F]{2})\r\n"
+)
 
 
 class State(enum.StrEnum):
@@ -109,6 +132,7 @@ class GeckoBootloaderProtocol(SerialProtocol):
         )
         self._version: str | None = None
         self._upload_status: str | None = None
+        self._upload_error: BootloaderError | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self._last_data_time = float("-inf")
 
@@ -274,6 +298,9 @@ class GeckoBootloaderProtocol(SerialProtocol):
         """Select `upload gbl` in the menu and upload GBL firmware."""
         await self.ebl_info()
 
+        self._upload_status = None
+        self._upload_error = None
+
         # Select the option
         self._state_machine.state = State.WAITING_XMODEM_READY
         self.send_data(GeckoBootloaderOption.UPLOAD_FIRMWARE)
@@ -297,13 +324,25 @@ class GeckoBootloaderProtocol(SerialProtocol):
         # Start the transfer
         self._xmodem_send_chunk_or_eot()
 
-        # Wait for transfer to complete
-        await self._xmodem_completion_future
+        try:
+            await self._xmodem_completion_future
+        except ReceiverCancelled:
+            # The bootloader prints why it cancelled, then its menu
+            await self._wait_for_menu_after_upload()
+            raise ReceiverCancelled(self._upload_error) from None
+        finally:
+            self._xmodem_firmware = None
+            self._xmodem_completion_future = None
 
-        # Clean up XMODEM state
-        self._xmodem_firmware = None
-        self._xmodem_completion_future = None
+        await self._wait_for_menu_after_upload()
 
+        if self._upload_status != "complete":
+            raise UploadError(
+                f"Upload status {self._upload_status!r}, error {self._upload_error}"
+            )
+
+    async def _wait_for_menu_after_upload(self) -> None:
+        """Wait for the menu that follows the upload status."""
         # After XMODEM completes, data_received processes the upload status message
         # and transitions: UPLOAD_DONE -> WAITING_FOR_MENU -> IN_MENU.
         # (if menu is buffered). The menu is sometimes sent immediately after upload.
@@ -313,9 +352,6 @@ class GeckoBootloaderProtocol(SerialProtocol):
         except TimeoutError:
             # If not, trigger it manually
             await self.ebl_info()
-
-        if self._upload_status != "complete":
-            raise UploadError(self._upload_status)
 
     def send_data(self, data: bytes) -> None:
         assert self._transport is not None
@@ -350,7 +386,10 @@ class GeckoBootloaderProtocol(SerialProtocol):
                 self._xmodem_retry_chunk()
                 return
             elif response == XModemPacketType.CAN:
+                # The bootloader prints why it cancelled after its `CAN` bytes
+                self._state_machine.state = State.WAITING_UPLOAD_DONE
                 self._xmodem_abort(ReceiverCancelled())
+                self.data_received(b"")
                 return
 
             # Anything else does not answer the block. If the block arrived, resending
@@ -434,13 +473,25 @@ class GeckoBootloaderProtocol(SerialProtocol):
                     break
 
                 status = match.group("status").decode("ascii")
+                end = match.end()
 
-                if status == "complete":
-                    self._upload_status = status
-                else:
-                    self._upload_status = match.group("message").decode("ascii")
+                if status == "aborted":
+                    error_match = UPLOAD_ERROR_REGEX.search(self._buffer, end)
 
-                del self._buffer[: match.span()[1]]
+                    if error_match is not None:
+                        self._upload_error = BootloaderError(
+                            kind=BootloaderErrorKind(
+                                error_match.group("kind").decode("ascii")
+                            ),
+                            code=int(error_match.group("code"), 16),
+                        )
+                        end = error_match.end()
+                    elif MENU_REGEX.search(self._buffer, end) is None:
+                        # Wait for the error, or for the menu if there is none
+                        break
+
+                self._upload_status = status
+                del self._buffer[:end]
                 self._state_machine.state = State.UPLOAD_DONE
 
                 _LOGGER.debug("Upload status: %s", self._upload_status)

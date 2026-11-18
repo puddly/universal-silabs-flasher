@@ -11,6 +11,8 @@ from universal_silabs_flasher.common import crc16_ccitt, pad_to_multiple
 from universal_silabs_flasher.gecko_bootloader import (
     MENU_QUIET_PERIOD,
     XMODEM_BLOCK_SIZE,
+    BootloaderError,
+    BootloaderErrorKind,
     GeckoBootloaderOption,
     GeckoBootloaderProtocol,
     ReceiverCancelled,
@@ -79,6 +81,16 @@ class Conversation(asyncio.Protocol):
 
     async def send_upload_complete(self) -> None:
         await self.send(b"\r\nSerial upload complete\r\n")
+
+    async def send_upload_aborted(self, kind: str, code: int) -> None:
+        """Cancel like the bootloader, with its misplaced NUL, then print the menu."""
+        await self.send(
+            b"\x18\x18\x18\r\nSerial upload aborted\r\n\x00"
+            + f"\r\n{kind} error 0x".encode("ascii")
+            + b"\x00"
+            + f"{code:02X}\r\n".encode("ascii")
+        )
+        await self.send_menu()
 
     async def expect_command(
         self,
@@ -276,7 +288,7 @@ async def test_xmodem_timeout() -> None:
 
 
 async def test_xmodem_cancellation() -> None:
-    """Test an XMODEM transfer that is cancelled by the receiver."""
+    """A rejected image ends the upload with its error, without a restart."""
     client, conversation = await create_test_pair()
 
     upload_task = asyncio.create_task(client.upload_firmware(FIRMWARE))
@@ -289,13 +301,18 @@ async def test_xmodem_cancellation() -> None:
     await conversation.expect_command(GeckoBootloaderOption.UPLOAD_FIRMWARE)
     await conversation.send(b"C")
 
-    # First packet is cancelled
+    # First packet is rejected because of the image's CRC
     await conversation.expect_packet(number=1)
-    await conversation.send_can()
+    await conversation.send_upload_aborted("file", 0x43)
 
-    with pytest.raises(ReceiverCancelled):
-        async with asyncio.timeout(1):
+    with pytest.raises(ReceiverCancelled) as exc_info:
+        async with asyncio.timeout(UPLOAD_COMPLETION_TIMEOUT):
             await upload_task
+
+    assert exc_info.value.error == BootloaderError(
+        kind=BootloaderErrorKind.FILE, code=0x43
+    )
+    assert str(exc_info.value) == "file error 0x43"
 
 
 async def test_xmodem_too_many_retries() -> None:
@@ -525,7 +542,7 @@ async def test_xmodem_connection_lost() -> None:
 
 
 async def test_xmodem_can_during_transfer() -> None:
-    """Test that the client handles CAN (cancel) byte during transfer."""
+    """An XMODEM error from the bootloader ends the upload with that error."""
     client, conversation = await create_test_pair()
 
     upload_task = asyncio.create_task(client.upload_firmware(FIRMWARE))
@@ -542,13 +559,17 @@ async def test_xmodem_can_during_transfer() -> None:
     await conversation.expect_packet(number=1)
     await conversation.send_ack()
 
-    # Second packet gets a CAN response
+    # Second packet arrives out of sequence
     await conversation.expect_packet(number=2)
-    await conversation.send(bytes([XModemPacketType.CAN]))
+    await conversation.send_upload_aborted("block", 0x25)
 
-    # The upload should fail with ReceiverCancelled
-    with pytest.raises(ReceiverCancelled):
-        await upload_task
+    with pytest.raises(ReceiverCancelled) as exc_info:
+        async with asyncio.timeout(UPLOAD_COMPLETION_TIMEOUT):
+            await upload_task
+
+    assert exc_info.value.error == BootloaderError(
+        kind=BootloaderErrorKind.BLOCK, code=0x25
+    )
 
 
 async def test_xmodem_empty_buffer_during_transfer() -> None:

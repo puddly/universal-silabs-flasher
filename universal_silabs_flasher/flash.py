@@ -19,7 +19,7 @@ import zigpy.types
 from .const import DEFAULT_PROBE_METHODS, ApplicationType, ResetTarget
 from .firmware import get_nabucasa_metadata
 from .flasher import DEVICE_SPECIFIC_FLASHERS, BaseFlasher, Flasher
-from .gecko_bootloader import XMODEM_BLOCK_SIZE, ReceiverCancelled
+from .gecko_bootloader import XMODEM_BLOCK_SIZE, BootloaderErrorKind, ReceiverCancelled
 
 _LOGGER = logging.getLogger(__name__)
 LOG_LEVELS = ["INFO", "DEBUG"]
@@ -340,10 +340,15 @@ async def _cmd_flash(
                 run_firmware=True,
                 progress_callback=lambda current, _: pbar.update(XMODEM_BLOCK_SIZE),
             )
-        except ReceiverCancelled:
-            print(
-                "Error: Firmware image was rejected by the device. Ensure this is"
-                " the correct image for this device.",
-                file=sys.stderr,
-            )
+        except ReceiverCancelled as exc:
+            if exc.error is not None and exc.error.kind == BootloaderErrorKind.FILE:
+                print(
+                    f"Error: Firmware image was rejected by the device ({exc})."
+                    " Ensure this is the correct image for this device.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Error: The device cancelled the upload ({exc})", file=sys.stderr
+                )
             sys.exit(1)
