@@ -11,13 +11,14 @@ import zipfile
 from aiohttp import web
 from aiohttp.test_utils import TestServer as AiohttpTestServer
 import pytest
+import tqdm
 
 from universal_silabs_flasher.const import (
     DEFAULT_PROBE_METHODS,
     ApplicationType,
     ResetTarget,
 )
-from universal_silabs_flasher.flash import main
+from universal_silabs_flasher.flash import _set_progress, main
 from universal_silabs_flasher.flasher import BaseFlasher, Flasher, Zbt2Flasher
 
 FIRMWARE_PATH = Path("tests/firmwares/skyconnect_zigbee_ncp_7.4.4.0.gbl")
@@ -448,3 +449,18 @@ async def test_firmware_download_failure():
 
     assert result.exit_code != 0
     assert "error" in result.stderr.lower()
+
+
+def test_progress_bar_follows_reported_position() -> None:
+    """The progress bar shows the reported position, even when an upload starts over."""
+    with tqdm.tqdm(total=1000, disable=True) as pbar:
+        _set_progress(pbar, 0, 2048)
+        _set_progress(pbar, 1024, 2048)
+        assert (pbar.n, pbar.total) == (1024, 2048)
+
+        # A restarted upload reports its earlier positions again
+        _set_progress(pbar, 0, 2048)
+        assert pbar.n == 0
+
+        _set_progress(pbar, 2048, 2048)
+        assert pbar.n == pbar.total

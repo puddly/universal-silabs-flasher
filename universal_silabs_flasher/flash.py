@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 from io import BytesIO
 import json
 import logging
@@ -19,7 +20,7 @@ import zigpy.types
 from .const import DEFAULT_PROBE_METHODS, ApplicationType, ResetTarget
 from .firmware import get_nabucasa_metadata
 from .flasher import DEVICE_SPECIFIC_FLASHERS, BaseFlasher, Flasher
-from .gecko_bootloader import XMODEM_BLOCK_SIZE, BootloaderErrorKind, ReceiverCancelled
+from .gecko_bootloader import BootloaderErrorKind, ReceiverCancelled
 
 _LOGGER = logging.getLogger(__name__)
 LOG_LEVELS = ["INFO", "DEBUG"]
@@ -292,6 +293,14 @@ async def _cmd_write_ieee(args: argparse.Namespace, flasher: Flasher) -> None:
         sys.exit(1)
 
 
+def _set_progress(pbar: tqdm.tqdm, current: int, total: int) -> None:
+    """Show the reported upload progress."""
+    # Uploads can be split in two or start over, so follow the reported position
+    pbar.total = total
+    pbar.n = current
+    pbar.refresh()
+
+
 async def _cmd_flash(
     args: argparse.Namespace, flasher: BaseFlasher, verbosity: int
 ) -> None:
@@ -338,7 +347,7 @@ async def _cmd_flash(
             await flasher.flash_firmware(
                 fw_image,
                 run_firmware=True,
-                progress_callback=lambda current, _: pbar.update(XMODEM_BLOCK_SIZE),
+                progress_callback=functools.partial(_set_progress, pbar),
             )
         except ReceiverCancelled as exc:
             if exc.error is not None and exc.error.kind == BootloaderErrorKind.FILE:
