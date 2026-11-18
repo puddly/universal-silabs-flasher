@@ -301,21 +301,45 @@ class GeckoBootloaderProtocol(SerialProtocol):
         firmware: bytes,
         *,
         max_failures: int = 3,
+        max_attempts: int = 3,
         progress_callback: typing.Callable[[int, int], typing.Any] | None = None,
     ) -> None:
         """Select `upload gbl` in the menu and upload GBL firmware."""
-        try:
-            await self._upload_firmware_attempt(
-                firmware,
-                max_failures=max_failures,
-                progress_callback=progress_callback,
+        # The bootloader invalidates the application as soon as it accepts the first
+        # block, so starting over after a communication error costs nothing
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self._upload_firmware_attempt(
+                    firmware,
+                    max_failures=max_failures,
+                    progress_callback=progress_callback,
+                )
+            except ReceiverCancelled as exc:
+                # The bootloader rejected the image, uploading it again won't help
+                if exc.error is not None and exc.error.kind == BootloaderErrorKind.FILE:
+                    raise
+
+                if attempt == max_attempts:
+                    raise
+
+                error: UploadError = exc
+            except UploadError as exc:
+                # The bootloader may still be waiting for blocks
+                await self._cancel_transfer()
+
+                if attempt == max_attempts:
+                    raise
+
+                error = exc
+            else:
+                return
+
+            _LOGGER.warning(
+                "Firmware upload failed (%s), starting over (attempt %d of %d)",
+                error,
+                attempt + 1,
+                max_attempts,
             )
-        except ReceiverCancelled:
-            raise
-        except UploadError:
-            # The bootloader may still be waiting for blocks
-            await self._cancel_transfer()
-            raise
 
     async def _upload_firmware_attempt(
         self,
